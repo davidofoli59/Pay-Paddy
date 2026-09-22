@@ -495,12 +495,20 @@
      CONFIG – replace with your real values. No placeholders in prod.
      ================================================================ */
   const firebaseConfig = {
-    apiKey: "YOUR_API_KEY",
-    authDomain: "YOUR_PROJECT.firebaseapp.com",
-    projectId: "YOUR_PROJECT_ID",
-    storageBucket: "YOUR_PROJECT.appspot.com",
-    messagingSenderId: "YOUR_SENDER_ID",
-    appId: "YOUR_APP_ID"
+  const firebaseConfig = {
+    apiKey: "AIzaSyCvNqqVX_ghYBl9g5JYMhk6NpFmMp4vMDo",
+    authDomain: "pay-adec1.firebaseapp.com",
+    projectId: "pay-adec1",
+    storageBucket: "pay-adec1.firebasestorage.app",
+    messagingSenderId: "626809294731",
+    appId: "1:626809294731:web:6072444c9f1f1bf19ae98e",
+    measurementId: "G-20GBJEVGVC"
+  };
+
+  // Initialize Firebase
+  const app = initializeApp(firebaseConfig);
+  const analytics = getAnalytics(app);
+
   };
 
   const API_BASE = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
