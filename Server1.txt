@@ -1,0 +1,3254 @@
+/**
+ * PayPaddy – Production Backend
+ *
+ * Security layers:
+ * Identity → Authentication → Authorization → Partner isolation →
+ * Payment authorization → Gateway verification → Transaction integrity →
+ * Audit trail → Fraud/abuse controls → Monitoring
+ *
+ * IMPORTANT:
+ * - Firebase Web API keys are NOT server credentials.
+ * - Firebase Admin requires a service account.
+ * - Payment success is ONLY established by an authenticated/verified gateway event.
+ * - Client redirect/callback URLs never establish payment success.
+ */
+
+'use strict';
+
+require('dotenv').config();
+
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const crypto = require('crypto');
+const path = require('path');
+const fs = require('fs');
+const { v4: uuidv4 } = require('uuid');
+const { z } = require('zod');
+
+// ============================================================================
+// 0. CONFIGURATION
+// ============================================================================
+
+function requireEnv(name, minLen = 1) {
+  const value = process.env[name];
+
+  if (!value || String(value).trim().length < minLen) {
+    console.error(`[FATAL] Missing or invalid environment variable: ${name}`);
+    process.exit(1);
+  }
+
+  return String(value).trim();
+}
+
+const PORT = Number(process.env.PORT || 3001);
+const NODE_ENV = process.env.NODE_ENV || 'production';
+
+const API_PUBLIC_URL =
+  process.env.API_PUBLIC_URL || `http://localhost:${PORT}`;
+
+const ALLOWED_ORIGINS = (
+  process.env.ALLOWED_ORIGINS ||
+  'http://localhost:5500,http://127.0.0.1:5500,http://localhost:3000'
+)
+  .split(',')
+  .map(v => v.trim())
+  .filter(Boolean);
+
+const PARTNER_TOKEN_SECRET = requireEnv('PARTNER_TOKEN_SECRET', 32);
+
+const FIREBASE_PROJECT_ID = 'pay-adec1';
+
+// ============================================================================
+// 1. FIREBASE ADMIN
+// ============================================================================
+
+let admin;
+let db;
+
+function initFirebase() {
+  const adminSdk = require('firebase-admin');
+
+  let credential;
+
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    try {
+      const parsed = JSON.parse(
+        process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+      );
+
+      if (!parsed.project_id) {
+        throw new Error('service account missing project_id');
+      }
+
+      credential = adminSdk.credential.cert(parsed);
+    } catch (err) {
+      console.error(
+        '[FATAL] FIREBASE_SERVICE_ACCOUNT_JSON is invalid'
+      );
+      process.exit(1);
+    }
+  } else {
+    const saPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH
+      ? path.resolve(
+          __dirname,
+          process.env.FIREBASE_SERVICE_ACCOUNT_PATH
+        )
+      : path.resolve(__dirname, 'serviceAccountKey.json');
+
+    if (!fs.existsSync(saPath)) {
+      console.error(
+        '[FATAL] Firebase service-account not found:',
+        saPath
+      );
+      console.error(
+        'Set FIREBASE_SERVICE_ACCOUNT_PATH or FIREBASE_SERVICE_ACCOUNT_JSON'
+      );
+      process.exit(1);
+    }
+
+    try {
+      credential = adminSdk.credential.cert(require(saPath));
+    } catch (err) {
+      console.error(
+        '[FATAL] Could not load Firebase service account:',
+        err.message
+      );
+      process.exit(1);
+    }
+  }
+
+  if (!adminSdk.apps.length) {
+    adminSdk.initializeApp({
+      credential,
+      projectId: FIREBASE_PROJECT_ID
+    });
+  }
+
+  admin = adminSdk;
+  db = adminSdk.firestore();
+
+  console.log(
+    `[firebase-admin] Initialized project=${FIREBASE_PROJECT_ID}`
+  );
+}
+
+initFirebase();
+
+// ============================================================================
+// 2. AUDIT
+// ============================================================================
+
+async function audit(event, details = {}) {
+  const entry = {
+    id: uuidv4(),
+    ts: new Date().toISOString(),
+    event,
+    ...details
+  };
+
+  console.log(
+    `[FCI-AUDIT] ${entry.ts} ${event}`,
+    JSON.stringify(details)
+  );
+
+  try {
+    await db.collection('audit_logs').doc(entry.id).set(entry);
+  } catch (err) {
+    console.error(
+      '[audit] persistent audit write failed:',
+      err.message
+    );
+  }
+
+  return entry;
+}
+
+// ============================================================================
+// 3. SECURITY HELPERS
+// ============================================================================
+
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') {
+    return false;
+  }
+
+  const aa = Buffer.from(a);
+  const bb = Buffer.from(b);
+
+  if (aa.length !== bb.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(aa, bb);
+}
+
+function hashSecret(value) {
+  return crypto
+    .createHash('sha256')
+    .update(value)
+    .digest('hex');
+}
+
+function validate(schema, data) {
+  const result = schema.safeParse(data);
+
+  if (!result.success) {
+    const message = result.error.issues
+      .map(issue =>
+        `${issue.path.join('.')}: ${issue.message}`
+      )
+      .join('; ');
+
+    const error = new Error(message);
+    error.status = 400;
+    error.code = 'VALIDATION_ERROR';
+
+    throw error;
+  }
+
+  return result.data;
+}
+
+// ============================================================================
+// 4. SCHEMAS
+// ============================================================================
+
+const PaymentCreateSchema = z.object({
+  amount: z.number().int().positive(),
+  currency: z
+    .string()
+    .length(3)
+    .transform(value => value.toUpperCase()),
+
+  gateway: z.enum([
+    'stripe',
+    'paypal',
+    'paystack',
+    'flutterwave',
+    'razorpay',
+    'square'
+  ]),
+
+  partnerReferenceId: z
+    .string()
+    .min(1)
+    .max(128)
+    .optional(),
+
+  idempotencyKey: z
+    .string()
+    .min(8)
+    .max(128)
+    .optional(),
+
+  description: z
+    .string()
+    .max(500)
+    .optional(),
+
+  metadata: z
+    .record(z.string())
+    .optional(),
+
+  successUrl: z
+    .string()
+    .url()
+    .optional(),
+
+  cancelUrl: z
+    .string()
+    .url()
+    .optional(),
+
+  email: z
+    .string()
+    .email()
+    .optional()
+});
+
+const PartnerTokenSchema = z.object({
+  clientId: z.string().min(8),
+  clientSecret: z.string().min(16),
+  grant_type: z.literal('client_credentials'),
+  scope: z.string().optional()
+});
+
+// ============================================================================
+// 5. FIREBASE AUTH
+// ============================================================================
+
+async function requireUserAuth(req, res, next) {
+  const authorization = req.headers.authorization || '';
+
+  if (!authorization.startsWith('Bearer ')) {
+    await audit('auth_missing_token', {
+      path: req.path,
+      ip: req.ip
+    });
+
+    return res.status(401).json({
+      error: 'Missing Authorization Bearer token',
+      code: 'AUTH_REQUIRED'
+    });
+  }
+
+  const token = authorization.slice(7).trim();
+
+  if (!token) {
+    return res.status(401).json({
+      error: 'Missing Authorization Bearer token',
+      code: 'AUTH_REQUIRED'
+    });
+  }
+
+  try {
+    const decoded = await admin
+      .auth()
+      .verifyIdToken(token, true);
+
+    req.user = decoded;
+    req.authType = 'user';
+
+    return next();
+  } catch (err) {
+    await audit('auth_token_invalid', {
+      path: req.path,
+      reason: err.code || 'UNKNOWN',
+      ip: req.ip
+    });
+
+    return res.status(401).json({
+      error: 'Invalid or expired token',
+      code:
+        err.code === 'auth/id-token-revoked'
+          ? 'TOKEN_REVOKED'
+          : 'TOKEN_INVALID'
+    });
+  }
+}
+
+// ============================================================================
+// 6. PARTNER TOKENS
+// ============================================================================
+
+const TOKEN_TTL = 3600;
+
+function signPartnerToken(payload) {
+  const header = Buffer
+    .from(JSON.stringify({
+      alg: 'HS256',
+      typ: 'JWT'
+    }))
+    .toString('base64url');
+
+  const body = Buffer
+    .from(JSON.stringify(payload))
+    .toString('base64url');
+
+  const signature = crypto
+    .createHmac('sha256', PARTNER_TOKEN_SECRET)
+    .update(`${header}.${body}`)
+    .digest('base64url');
+
+  return `${header}.${body}.${signature}`;
+}
+
+function verifyPartnerToken(token) {
+  const parts = String(token).split('.');
+
+  if (parts.length !== 3) {
+    throw new Error('Malformed token');
+  }
+
+  const [header, body, signature] = parts;
+
+  let parsedHeader;
+  let payload;
+
+  try {
+    parsedHeader = JSON.parse(
+      Buffer.from(header, 'base64url').toString('utf8')
+    );
+
+    payload = JSON.parse(
+      Buffer.from(body, 'base64url').toString('utf8')
+    );
+  } catch {
+    throw new Error('Malformed token');
+  }
+
+  if (
+    parsedHeader.alg !== 'HS256' ||
+    parsedHeader.typ !== 'JWT'
+  ) {
+    throw new Error('Invalid token header');
+  }
+
+  const expected = crypto
+    .createHmac('sha256', PARTNER_TOKEN_SECRET)
+    .update(`${header}.${body}`)
+    .digest('base64url');
+
+  if (!safeEqual(signature, expected)) {
+    throw new Error('Invalid token signature');
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+
+  if (!payload.exp || payload.exp <= now) {
+    throw new Error('Token expired');
+  }
+
+  if (
+    !payload.iat ||
+    payload.iat > now + 60
+  ) {
+    throw new Error('Invalid token time');
+  }
+
+  if (
+    payload.typ !== 'partner_access' ||
+    !payload.sub ||
+    !payload.partnerId
+  ) {
+    throw new Error('Invalid token claims');
+  }
+
+  return payload;
+}
+
+async function requirePartnerAuth(req, res, next) {
+  const authorization = req.headers.authorization || '';
+
+  if (!authorization.startsWith('Bearer ')) {
+    return res.status(401).json({
+      error: 'Missing partner access token',
+      code: 'PARTNER_AUTH_REQUIRED'
+    });
+  }
+
+  try {
+    req.partner = verifyPartnerToken(
+      authorization.slice(7)
+    );
+
+    req.authType = 'partner';
+
+    return next();
+  } catch (err) {
+    await audit('partner_auth_failed', {
+      reason: err.message,
+      ip: req.ip
+    });
+
+    return res.status(401).json({
+      error: 'Invalid partner access token',
+      code: 'PARTNER_TOKEN_INVALID'
+    });
+  }
+}
+
+async function requireAnyAuth(req, res, next) {
+  const authorization = req.headers.authorization || '';
+
+  if (!authorization.startsWith('Bearer ')) {
+    return res.status(401).json({
+      error: 'Authorization required',
+      code: 'AUTH_REQUIRED'
+    });
+  }
+
+  const token = authorization.slice(7);
+
+  try {
+    req.partner = verifyPartnerToken(token);
+    req.authType = 'partner';
+    return next();
+  } catch {
+    return requireUserAuth(req, res, next);
+  }
+}
+
+// ============================================================================
+// 7. PARTNER OAUTH
+// ============================================================================
+
+async function getPartner(clientId) {
+  const doc = await db
+    .collection('partners')
+    .doc(clientId)
+    .get();
+
+  if (!doc.exists) {
+    return null;
+  }
+
+  return {
+    id: doc.id,
+    ...doc.data()
+  };
+}
+
+async function issueClientCredentialsToken(body) {
+  const data = validate(
+    PartnerTokenSchema,
+    body
+  );
+
+  const partner = await getPartner(data.clientId);
+
+  if (
+    !partner ||
+    partner.active === false
+  ) {
+    await audit(
+      'partner_auth_unknown_client',
+      {
+        clientId: data.clientId
+      }
+    );
+
+    const error = new Error(
+      'Invalid client credentials'
+    );
+
+    error.status = 401;
+    error.code = 'INVALID_CLIENT';
+
+    throw error;
+  }
+
+  const suppliedHash = hashSecret(
+    data.clientSecret
+  );
+
+  if (
+    !safeEqual(
+      suppliedHash,
+      partner.clientSecretHash || ''
+    )
+  ) {
+    await audit(
+      'partner_auth_bad_secret',
+      {
+        clientId: data.clientId
+      }
+    );
+
+    const error = new Error(
+      'Invalid client credentials'
+    );
+
+    error.status = 401;
+    error.code = 'INVALID_CLIENT';
+
+    throw error;
+  }
+
+  const allowedScopes = new Set(
+    partner.scopes || [
+      'payments:create',
+      'payments:read'
+    ]
+  );
+
+  const requestedScopes = (
+    data.scope ||
+    Array.from(allowedScopes).join(' ')
+  )
+    .split(/\s+/)
+    .filter(Boolean);
+
+  for (const scope of requestedScopes) {
+    if (!allowedScopes.has(scope)) {
+      const error = new Error(
+        `Scope not allowed: ${scope}`
+      );
+
+      error.status = 400;
+      error.code = 'INVALID_SCOPE';
+
+      throw error;
+    }
+  }
+
+  const now = Math.floor(
+    Date.now() / 1000
+  );
+
+  const payload = {
+    typ: 'partner_access',
+    sub: partner.clientId,
+    partnerId: partner.clientId,
+    name: partner.name || '',
+    scopes: requestedScopes,
+    iat: now,
+    exp: now + TOKEN_TTL,
+    jti: uuidv4()
+  };
+
+  await audit(
+    'partner_token_issued',
+    {
+      partnerId: partner.clientId,
+      scopes: requestedScopes
+    }
+  );
+
+  return {
+    access_token: signPartnerToken(payload),
+    token_type: 'Bearer',
+    expires_in: TOKEN_TTL,
+    scope: requestedScopes.join(' ')
+  };
+}
+
+// ============================================================================
+// 8. CURRENCY / PAYMENT VALIDATION
+// ============================================================================
+
+const ZERO_DECIMAL_CURRENCIES = new Set([
+  'JPY',
+  'KRW',
+  'VND',
+  'CLP',
+  'XAF',
+  'XOF',
+  'XPF'
+]);
+
+function validateAmountForCurrency(amount, currency) {
+  if (!Number.isInteger(amount) || amount <= 0) {
+    const error = new Error(
+      'Amount must be a positive integer in minor units'
+    );
+
+    error.status = 400;
+    error.code = 'INVALID_AMOUNT';
+
+    throw error;
+  }
+
+  if (
+    ZERO_DECIMAL_CURRENCIES.has(currency) &&
+    !Number.isInteger(amount)
+  ) {
+    const error = new Error(
+      `Invalid minor-unit amount for ${currency}`
+    );
+
+    error.status = 400;
+    error.code = 'INVALID_AMOUNT';
+
+    throw error;
+  }
+}
+
+// ============================================================================
+// 9. GATEWAY CONFIG
+// ============================================================================
+
+function requireGatewayEnv(name) {
+  const value = process.env[name];
+
+  if (!value || !String(value).trim()) {
+    const error = new Error(
+      `Gateway configuration missing: ${name}`
+    );
+
+    error.status = 503;
+    error.code = 'GATEWAY_CONFIG_MISSING';
+
+    throw error;
+  }
+
+  return String(value).trim();
+}
+
+// ============================================================================
+// 10. STRIPE
+// ============================================================================
+
+async function createStripeSession(payment) {
+  const secret = requireGatewayEnv(
+    'STRIPE_SECRET_KEY'
+  );
+
+  let stripe;
+
+  try {
+    stripe = require('stripe')(secret);
+  } catch {
+    const error = new Error(
+      'stripe package not installed'
+    );
+
+    error.status = 503;
+    error.code = 'GATEWAY_SDK_MISSING';
+
+    throw error;
+  }
+
+  const session = await stripe.checkout.sessions.create(
+    {
+      mode: 'payment',
+
+      line_items: [
+        {
+          price_data: {
+            currency:
+              payment.currency.toLowerCase(),
+
+            product_data: {
+              name:
+                payment.description ||
+                'Payment'
+            },
+
+            unit_amount: payment.amount
+          },
+
+          quantity: 1
+        }
+      ],
+
+      success_url:
+        payment.successUrl ||
+        `${API_PUBLIC_URL}/?payment=success`,
+
+      cancel_url:
+        payment.cancelUrl ||
+        `${API_PUBLIC_URL}/?payment=cancel`,
+
+      metadata: payment.gatewayMetadata,
+
+      client_reference_id:
+        payment.internalReference
+    },
+
+    payment.idempotencyKey
+      ? {
+          idempotencyKey:
+            payment.idempotencyKey
+        }
+      : undefined
+  );
+
+  await audit(
+    'gateway_session_created',
+    {
+      gateway: 'stripe',
+      id: session.id
+    }
+  );
+
+  return {
+    gatewayPaymentId: session.id,
+    checkoutUrl: session.url,
+    status: 'pending'
+  };
+}
+
+// ============================================================================
+// 11. PAYSTACK
+// ============================================================================
+
+async function createPaystackSession(payment) {
+  const secret = requireGatewayEnv(
+    'PAYSTACK_SECRET_KEY'
+  );
+
+  const reference =
+    `pp_${crypto.randomUUID()}`;
+
+  const response = await fetch(
+    'https://api.paystack.co/transaction/initialize',
+    {
+      method: 'POST',
+
+      headers: {
+        Authorization: `Bearer ${secret}`,
+        'Content-Type': 'application/json'
+      },
+
+      body: JSON.stringify({
+        amount: payment.amount,
+
+        currency:
+          payment.currency,
+
+        email:
+          payment.email ||
+          'customer@paypaddy.local',
+
+        reference,
+
+        callback_url:
+          payment.successUrl,
+
+        metadata:
+          payment.gatewayMetadata
+      })
+    }
+  );
+
+  const data = await response.json();
+
+  if (
+    !response.ok ||
+    !data.status
+  ) {
+    const error = new Error(
+      data.message ||
+      'Paystack initialization failed'
+    );
+
+    error.status = 502;
+    error.code = 'GATEWAY_ERROR';
+
+    throw error;
+  }
+
+  await audit(
+    'gateway_session_created',
+    {
+      gateway: 'paystack',
+      id: reference
+    }
+  );
+
+  return {
+    gatewayPaymentId: reference,
+    checkoutUrl:
+      data.data.authorization_url,
+    status: 'pending'
+  };
+}
+
+// ============================================================================
+// 12. FLUTTERWAVE
+// ============================================================================
+
+async function createFlutterwaveSession(payment) {
+  const secret = requireGatewayEnv(
+    'FLUTTERWAVE_SECRET_KEY'
+  );
+
+  const txRef =
+    `pp_${crypto.randomUUID()}`;
+
+  const response = await fetch(
+    'https://api.flutterwave.com/v3/payments',
+    {
+      method: 'POST',
+
+      headers: {
+        Authorization: `Bearer ${secret}`,
+        'Content-Type': 'application/json'
+      },
+
+      body: JSON.stringify({
+        tx_ref: txRef,
+
+        amount:
+          payment.amount / 100,
+
+        currency:
+          payment.currency,
+
+        redirect_url:
+          payment.successUrl ||
+          API_PUBLIC_URL,
+
+        customer: {
+          email:
+            payment.email ||
+            'customer@paypaddy.local'
+        },
+
+        customizations: {
+          title:
+            payment.description ||
+            'PayPaddy Payment'
+        },
+
+        meta:
+          payment.gatewayMetadata
+      })
+    }
+  );
+
+  const data = await response.json();
+
+  if (
+    !response.ok ||
+    data.status !== 'success'
+  ) {
+    const error = new Error(
+      data.message ||
+      'Flutterwave payment creation failed'
+    );
+
+    error.status = 502;
+    error.code = 'GATEWAY_ERROR';
+
+    throw error;
+  }
+
+  await audit(
+    'gateway_session_created',
+    {
+      gateway: 'flutterwave',
+      id: txRef
+    }
+  );
+
+  return {
+    gatewayPaymentId: txRef,
+    checkoutUrl: data.data.link,
+    status: 'pending'
+  };
+}
+
+// ============================================================================
+// 13. PAYPAL
+// ============================================================================
+
+async function getPayPalAccessToken() {
+  const clientId = requireGatewayEnv(
+    'PAYPAL_CLIENT_ID'
+  );
+
+  const clientSecret = requireGatewayEnv(
+    'PAYPAL_CLIENT_SECRET'
+  );
+
+  const base =
+    process.env.PAYPAL_MODE === 'live'
+      ? 'https://api-m.paypal.com'
+      : 'https://api-m.sandbox.paypal.com';
+
+  const response = await fetch(
+    `${base}/v1/oauth2/token`,
+    {
+      method: 'POST',
+
+      headers: {
+        Authorization:
+          'Basic ' +
+          Buffer.from(
+            `${clientId}:${clientSecret}`
+          ).toString('base64'),
+
+        'Content-Type':
+          'application/x-www-form-urlencoded'
+      },
+
+      body:
+        'grant_type=client_credentials'
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    const error = new Error(
+      'PayPal authentication failed'
+    );
+
+    error.status = 502;
+    error.code = 'GATEWAY_ERROR';
+
+    throw error;
+  }
+
+  return {
+    token: data.access_token,
+    base
+  };
+}
+
+async function createPayPalOrder(payment) {
+  const {
+    token,
+    base
+  } = await getPayPalAccessToken();
+
+  const response = await fetch(
+    `${base}/v2/checkout/orders`,
+    {
+      method: 'POST',
+
+      headers: {
+        Authorization:
+          `Bearer ${token}`,
+
+        'Content-Type':
+          'application/json'
+      },
+
+      body: JSON.stringify({
+        intent: 'CAPTURE',
+
+        purchase_units: [
+          {
+            reference_id:
+              payment.internalReference,
+
+            amount: {
+              currency_code:
+                payment.currency,
+
+              value:
+                (payment.amount / 100)
+                  .toFixed(2)
+            },
+
+            description:
+              payment.description ||
+              'PayPaddy Payment'
+          }
+        ],
+
+        application_context: {
+          return_url:
+            payment.successUrl ||
+            API_PUBLIC_URL,
+
+          cancel_url:
+            payment.cancelUrl ||
+            API_PUBLIC_URL
+        }
+      })
+    }
+  );
+
+  const order = await response.json();
+
+  if (!response.ok) {
+    const error = new Error(
+      order.message ||
+      'PayPal order failed'
+    );
+
+    error.status = 502;
+    error.code = 'GATEWAY_ERROR';
+
+    throw error;
+  }
+
+  const approval = (
+    order.links || []
+  ).find(
+    link => link.rel === 'approve'
+  );
+
+  await audit(
+    'gateway_session_created',
+    {
+      gateway: 'paypal',
+      id: order.id
+    }
+  );
+
+  return {
+    gatewayPaymentId: order.id,
+    checkoutUrl:
+      approval?.href || null,
+    status: 'pending'
+  };
+}
+
+// ============================================================================
+// 14. RAZORPAY
+// ============================================================================
+
+async function createRazorpayOrder(payment) {
+  const keyId = requireGatewayEnv(
+    'RAZORPAY_KEY_ID'
+  );
+
+  const keySecret = requireGatewayEnv(
+    'RAZORPAY_KEY_SECRET'
+  );
+
+  const response = await fetch(
+    'https://api.razorpay.com/v1/orders',
+    {
+      method: 'POST',
+
+      headers: {
+        Authorization:
+          'Basic ' +
+          Buffer.from(
+            `${keyId}:${keySecret}`
+          ).toString('base64'),
+
+        'Content-Type':
+          'application/json'
+      },
+
+      body: JSON.stringify({
+        amount:
+          payment.amount,
+
+        currency:
+          payment.currency,
+
+        receipt:
+          payment.internalReference,
+
+        notes:
+          payment.gatewayMetadata
+      })
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    const error = new Error(
+      data.error?.description ||
+      'Razorpay order failed'
+    );
+
+    error.status = 502;
+    error.code = 'GATEWAY_ERROR';
+
+    throw error;
+  }
+
+  await audit(
+    'gateway_session_created',
+    {
+      gateway: 'razorpay',
+      id: data.id
+    }
+  );
+
+  return {
+    gatewayPaymentId: data.id,
+    checkoutUrl: null,
+    status: 'pending',
+    clientKey: keyId
+  };
+}
+
+// ============================================================================
+// 15. SQUARE
+// ============================================================================
+
+async function createSquareLink(payment) {
+  const token = requireGatewayEnv(
+    'SQUARE_ACCESS_TOKEN'
+  );
+
+  const locationId = requireGatewayEnv(
+    'SQUARE_LOCATION_ID'
+  );
+
+  const environment =
+    process.env.SQUARE_ENVIRONMENT ===
+    'sandbox'
+      ? 'sandbox'
+      : 'production';
+
+  const base =
+    environment === 'sandbox'
+      ? 'https://connect.squareupsandbox.com'
+      : 'https://connect.squareup.com';
+
+  const response = await fetch(
+    `${base}/v2/online-checkout/payment-links`,
+    {
+      method: 'POST',
+
+      headers: {
+        Authorization:
+          `Bearer ${token}`,
+
+        'Content-Type':
+          'application/json',
+
+        'Square-Version':
+          '2024-01-18'
+      },
+
+      body: JSON.stringify({
+        idempotency_key:
+          payment.idempotencyKey ||
+          crypto.randomUUID(),
+
+        order: {
+          location_id:
+            locationId,
+
+          line_items: [
+            {
+              name:
+                payment.description ||
+                'Payment',
+
+              quantity: '1',
+
+              base_price_money: {
+                amount:
+                  payment.amount,
+
+                currency:
+                  payment.currency
+              }
+            }
+          ]
+        },
+
+        checkout_options: {
+          redirect_url:
+            payment.successUrl
+        }
+      })
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    const error = new Error(
+      data.errors?.[0]?.detail ||
+      'Square payment link failed'
+    );
+
+    error.status = 502;
+    error.code = 'GATEWAY_ERROR';
+
+    throw error;
+  }
+
+  await audit(
+    'gateway_session_created',
+    {
+      gateway: 'square',
+      id: data.payment_link?.id
+    }
+  );
+
+  return {
+    gatewayPaymentId:
+      data.payment_link?.id,
+
+    checkoutUrl:
+      data.payment_link?.url,
+
+    status: 'pending'
+  };
+}
+
+const gatewayAdapters = {
+  stripe: createStripeSession,
+  paystack: createPaystackSession,
+  flutterwave: createFlutterwaveSession,
+  paypal: createPayPalOrder,
+  razorpay: createRazorpayOrder,
+  square: createSquareLink
+};
+
+async function createGatewayPayment(
+  gateway,
+  payment
+) {
+  const adapter =
+    gatewayAdapters[gateway];
+
+  if (!adapter) {
+    const error = new Error(
+      `Unsupported gateway: ${gateway}`
+    );
+
+    error.status = 400;
+    error.code = 'UNSUPPORTED_GATEWAY';
+
+    throw error;
+  }
+
+  return adapter(payment);
+}
+
+// ============================================================================
+// 16. PAYMENT SESSION CREATION
+// ============================================================================
+
+async function reserveIdempotency(
+  actorId,
+  key,
+  requestFingerprint
+) {
+  const id = crypto
+    .createHash('sha256')
+    .update(`${actorId}:${key}`)
+    .digest('hex');
+
+  const ref = db
+    .collection('idempotency_keys')
+    .doc(id);
+
+  return db.runTransaction(
+    async transaction => {
+      const existing =
+        await transaction.get(ref);
+
+      if (existing.exists) {
+        const data = existing.data();
+
+        if (
+          data.requestFingerprint !==
+          requestFingerprint
+        ) {
+          const error = new Error(
+            'Idempotency key reused with different request'
+          );
+
+          error.status = 409;
+          error.code =
+            'IDEMPOTENCY_KEY_REUSED';
+
+          throw error;
+        }
+
+        return {
+          existing: true,
+          response: data.response || null
+        };
+      }
+
+      transaction.create(ref, {
+        actorId,
+        key,
+        requestFingerprint,
+        status: 'reserved',
+        createdAt:
+          new Date().toISOString()
+      });
+
+      return {
+        existing: false,
+        response: null
+      };
+    }
+  );
+}
+
+async function saveIdempotencyResponse(
+  actorId,
+  key,
+  response
+) {
+  const id = crypto
+    .createHash('sha256')
+    .update(`${actorId}:${key}`)
+    .digest('hex');
+
+  await db
+    .collection('idempotency_keys')
+    .doc(id)
+    .update({
+      status: 'completed',
+      response,
+      completedAt:
+        new Date().toISOString()
+    });
+}
+
+async function createPaymentSession(
+  actor,
+  body
+) {
+  const data = validate(
+    PaymentCreateSchema,
+    body
+  );
+
+  validateAmountForCurrency(
+    data.amount,
+    data.currency
+  );
+
+  const fingerprint = crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        amount: data.amount,
+        currency: data.currency,
+        gateway: data.gateway,
+        partnerReferenceId:
+          data.partnerReferenceId || null
+      })
+    )
+    .digest('hex');
+
+  if (data.idempotencyKey) {
+    const reservation =
+      await reserveIdempotency(
+        actor.id,
+        data.idempotencyKey,
+        fingerprint
+      );
+
+    if (
+      reservation.existing &&
+      reservation.response
+    ) {
+      return reservation.response;
+    }
+
+    if (reservation.existing) {
+      const error = new Error(
+        'Request is already being processed'
+      );
+
+      error.status = 409;
+      error.code =
+        'IDEMPOTENCY_IN_PROGRESS';
+
+      throw error;
+    }
+  }
+
+  const sessionId =
+    `ps_${uuidv4().replace(/-/g, '')}`;
+
+  const partnerId =
+    actor.type === 'partner'
+      ? actor.id
+      : null;
+
+  const userId =
+    actor.type === 'user'
+      ? actor.id
+      : null;
+
+  const internalReference =
+    `pp_${uuidv4()}`;
+
+  const gatewayMetadata = {
+    ...(data.metadata || {}),
+
+    paypaddySessionId:
+      sessionId,
+
+    paypaddyReference:
+      internalReference
+  };
+
+  const gateway =
+    await createGatewayPayment(
+      data.gateway,
+      {
+        amount: data.amount,
+        currency: data.currency,
+        description: data.description,
+        successUrl: data.successUrl,
+        cancelUrl: data.cancelUrl,
+        idempotencyKey:
+          data.idempotencyKey,
+        email: data.email,
+        internalReference,
+        gatewayMetadata
+      }
+    );
+
+  const now =
+    new Date().toISOString();
+
+  const session = {
+    id: sessionId,
+
+    partnerId,
+    userId,
+
+    amount: data.amount,
+    currency: data.currency,
+
+    gateway: data.gateway,
+
+    partnerReferenceId:
+      data.partnerReferenceId || null,
+
+    internalReference,
+
+    description:
+      data.description || '',
+
+    gatewayPaymentId:
+      gateway.gatewayPaymentId,
+
+    checkoutUrl:
+      gateway.checkoutUrl || null,
+
+    clientKey:
+      gateway.clientKey || null,
+
+    status: 'pending',
+
+    receiptId: null,
+    invoiceId: null,
+
+    createdAt: now,
+    updatedAt: now,
+
+    metadata:
+      data.metadata || {}
+  };
+
+  const batch =
+    db.batch();
+
+  batch.set(
+    db
+      .collection('payment_sessions')
+      .doc(sessionId),
+    session
+  );
+
+  batch.set(
+    db
+      .collection('transactions')
+      .doc(sessionId),
+    {
+      id: sessionId,
+      sessionId,
+      partnerId,
+      userId,
+
+      amount: data.amount,
+      currency: data.currency,
+
+      gateway: data.gateway,
+
+      gatewayPaymentId:
+        gateway.gatewayPaymentId,
+
+      status: 'pending',
+
+      createdAt: now,
+      updatedAt: now
+    }
+  );
+
+  await batch.commit();
+
+  const response = {
+    paymentSessionId: sessionId,
+    status: 'pending',
+
+    checkoutUrl:
+      session.checkoutUrl,
+
+    gatewayPaymentId:
+      session.gatewayPaymentId,
+
+    clientKey:
+      session.clientKey,
+
+    amount:
+      session.amount,
+
+    currency:
+      session.currency
+  };
+
+  if (data.idempotencyKey) {
+    await saveIdempotencyResponse(
+      actor.id,
+      data.idempotencyKey,
+      response
+    );
+  }
+
+  await audit(
+    'payment_session_created',
+    {
+      sessionId,
+      partnerId,
+      userId,
+      gateway: data.gateway,
+      amount: data.amount,
+      currency: data.currency
+    }
+  );
+
+  return response;
+}
+
+// ============================================================================
+// 17. PAYMENT STATE TRANSITIONS
+// ============================================================================
+
+const VALID_TRANSITIONS = {
+  pending: new Set([
+    'paid',
+    'failed',
+    'expired'
+  ]),
+
+  failed: new Set([]),
+
+  expired: new Set([]),
+
+  paid: new Set([])
+};
+
+function assertValidTransition(
+  current,
+  next
+) {
+  if (current === next) {
+    return;
+  }
+
+  const allowed =
+    VALID_TRANSITIONS[current];
+
+  if (!allowed || !allowed.has(next)) {
+    const error = new Error(
+      `Invalid payment state transition: ${current} -> ${next}`
+    );
+
+    error.status = 409;
+    error.code =
+      'INVALID_PAYMENT_TRANSITION';
+
+    throw error;
+  }
+}
+
+// ============================================================================
+// 18. PERSISTENT WEBHOOK IDEMPOTENCY
+// ============================================================================
+
+async function claimWebhook(
+  gateway,
+  eventId
+) {
+  if (!eventId) {
+    const error = new Error(
+      'Webhook event ID is required'
+    );
+
+    error.status = 400;
+    error.code =
+      'WEBHOOK_EVENT_ID_REQUIRED';
+
+    throw error;
+  }
+
+  const id = crypto
+    .createHash('sha256')
+    .update(`${gateway}:${eventId}`)
+    .digest('hex');
+
+  const ref = db
+    .collection('webhook_events')
+    .doc(id);
+
+  return db.runTransaction(
+    async transaction => {
+      const existing =
+        await transaction.get(ref);
+
+      if (existing.exists) {
+        return false;
+      }
+
+      transaction.create(ref, {
+        gateway,
+        eventId,
+        receivedAt:
+          new Date().toISOString()
+      });
+
+      return true;
+    }
+  );
+}
+
+// ============================================================================
+// 19. APPLY VERIFIED GATEWAY RESULT
+// ============================================================================
+
+async function applyGatewayResult({
+  gateway,
+  gatewayPaymentId,
+  status,
+  amount,
+  currency,
+  raw
+}) {
+  if (
+    !gatewayPaymentId ||
+    !status
+  ) {
+    return null;
+  }
+
+  const query =
+    await db
+      .collection('payment_sessions')
+      .where(
+        'gatewayPaymentId',
+        '==',
+        gatewayPaymentId
+      )
+      .where(
+        'gateway',
+        '==',
+        gateway
+      )
+      .limit(1)
+      .get();
+
+  if (query.empty) {
+    await audit(
+      'webhook_unknown_payment',
+      {
+        gateway,
+        gatewayPaymentId
+      }
+    );
+
+    return null;
+  }
+
+  const ref =
+    query.docs[0].ref;
+
+  const result =
+    await db.runTransaction(
+      async transaction => {
+        const snapshot =
+          await transaction.get(ref);
+
+        if (!snapshot.exists) {
+          return null;
+        }
+
+        const session = {
+          id: snapshot.id,
+          ...snapshot.data()
+        };
+
+        assertValidTransition(
+          session.status,
+          status
+        );
+
+        if (
+          amount !== undefined &&
+          amount !== null &&
+          Number(amount) !==
+            Number(session.amount)
+        ) {
+          const error = new Error(
+            'Gateway amount does not match payment session'
+          );
+
+          error.status = 409;
+          error.code =
+            'PAYMENT_AMOUNT_MISMATCH';
+
+          throw error;
+        }
+
+        if (
+          currency &&
+          String(currency).toUpperCase() !==
+            String(session.currency).toUpperCase()
+        ) {
+          const error = new Error(
+            'Gateway currency does not match payment session'
+          );
+
+          error.status = 409;
+          error.code =
+            'PAYMENT_CURRENCY_MISMATCH';
+
+          throw error;
+        }
+
+        const now =
+          new Date().toISOString();
+
+        const updates = {
+          status,
+          updatedAt: now,
+          gatewayRaw: raw || null
+        };
+
+        if (status === 'paid') {
+          updates.receiptId =
+            session.receiptId ||
+            `RCP-${Date.now()
+              .toString(36)
+              .toUpperCase()}-${uuidv4()
+              .slice(0, 8)
+              .toUpperCase()}`;
+
+          updates.invoiceId =
+            session.invoiceId ||
+            `INV-${Date.now()
+              .toString(36)
+              .toUpperCase()}`;
+
+          updates.paidAt =
+            session.paidAt || now;
+        }
+
+        transaction.update(
+          ref,
+          updates
+        );
+
+        const transactionRef =
+          db
+            .collection('transactions')
+            .doc(session.id);
+
+        transaction.set(
+          transactionRef,
+          {
+            id: session.id,
+            sessionId: session.id,
+            partnerId:
+              session.partnerId || null,
+            userId:
+              session.userId || null,
+
+            amount:
+              session.amount,
+
+            currency:
+              session.currency,
+
+            gateway:
+              session.gateway,
+
+            gatewayPaymentId:
+              session.gatewayPaymentId,
+
+            status,
+
+            receiptId:
+              updates.receiptId ||
+              session.receiptId ||
+              null,
+
+            invoiceId:
+              updates.invoiceId ||
+              session.invoiceId ||
+              null,
+
+            paidAt:
+              updates.paidAt ||
+              session.paidAt ||
+              null,
+
+            updatedAt: now
+          },
+          { merge: true }
+        );
+
+        if (status === 'paid') {
+          transaction.set(
+            db
+              .collection('invoices')
+              .doc(updates.invoiceId),
+            {
+              id:
+                updates.invoiceId,
+
+              sessionId:
+                session.id,
+
+              partnerId:
+                session.partnerId || null,
+
+              userId:
+                session.userId || null,
+
+              amount:
+                session.amount,
+
+              currency:
+                session.currency,
+
+              gateway:
+                session.gateway,
+
+              partnerReferenceId:
+                session.partnerReferenceId ||
+                null,
+
+              createdAt:
+                session.createdAt,
+
+              paidAt:
+                updates.paidAt
+            },
+            { merge: true }
+          );
+
+          transaction.set(
+            db
+              .collection('receipts')
+              .doc(updates.receiptId),
+            {
+              id:
+                updates.receiptId,
+
+              sessionId:
+                session.id,
+
+              invoiceId:
+                updates.invoiceId,
+
+              partnerId:
+                session.partnerId || null,
+
+              userId:
+                session.userId || null,
+
+              amount:
+                session.amount,
+
+              currency:
+                session.currency,
+
+              gateway:
+                session.gateway,
+
+              partnerReferenceId:
+                session.partnerReferenceId ||
+                null,
+
+              description:
+                session.description,
+
+              paidAt:
+                updates.paidAt,
+
+              createdAt:
+                session.createdAt
+            },
+            { merge: true }
+          );
+        }
+
+        return {
+          ...session,
+          ...updates
+        };
+      }
+    );
+
+  if (result) {
+    await audit(
+      'payment_status_updated',
+      {
+        sessionId: result.id,
+        gateway,
+        status,
+        receiptId:
+          result.receiptId || null
+      }
+    );
+  }
+
+  return result;
+}
+
+// ============================================================================
+// 20. STRIPE WEBHOOK
+// ============================================================================
+
+const webhookRouter =
+  express.Router();
+
+webhookRouter.post(
+  '/stripe',
+  express.raw({
+    type: 'application/json'
+  }),
+  async (req, res) => {
+    try {
+      const secret =
+        requireGatewayEnv(
+          'STRIPE_WEBHOOK_SECRET'
+        );
+
+      let stripe;
+
+      try {
+        stripe =
+          require('stripe')(
+            requireGatewayEnv(
+              'STRIPE_SECRET_KEY'
+            )
+          );
+      } catch {
+        return res.status(503).json({
+          error:
+            'Stripe SDK not installed',
+          code:
+            'GATEWAY_SDK_MISSING'
+        });
+      }
+
+      let event;
+
+      try {
+        event =
+          stripe.webhooks.constructEvent(
+            req.body,
+            req.headers[
+              'stripe-signature'
+            ],
+            secret
+          );
+      } catch (err) {
+        await audit(
+          'webhook_signature_failed',
+          {
+            gateway: 'stripe'
+          }
+        );
+
+        return res.status(401).json({
+          error:
+            'Invalid Stripe webhook signature',
+          code:
+            'WEBHOOK_SIGNATURE_INVALID'
+        });
+      }
+
+      const claimed =
+        await claimWebhook(
+          'stripe',
+          event.id
+        );
+
+      if (!claimed) {
+        return res.json({
+          received: true,
+          duplicate: true
+        });
+      }
+
+      const object =
+        event.data?.object;
+
+      if (
+        event.type ===
+        'checkout.session.completed'
+      ) {
+        await applyGatewayResult({
+          gateway: 'stripe',
+
+          gatewayPaymentId:
+            object.id,
+
+          status: 'paid',
+
+          amount:
+            object.amount_total,
+
+          currency:
+            object.currency?.toUpperCase(),
+
+          raw: object
+        });
+      }
+
+      if (
+        event.type ===
+        'checkout.session.expired'
+      ) {
+        await applyGatewayResult({
+          gateway: 'stripe',
+
+          gatewayPaymentId:
+            object.id,
+
+          status: 'expired',
+
+          raw: object
+        });
+      }
+
+      return res.json({
+        received: true
+      });
+    } catch (err) {
+      console.error(
+        '[webhook/stripe]',
+        err.message
+      );
+
+      return res.status(
+        err.status || 400
+      ).json({
+        error:
+          err.message,
+        code:
+          err.code
+      });
+    }
+  }
+);
+
+// ============================================================================
+// 21. PAYSTACK WEBHOOK
+// ============================================================================
+
+webhookRouter.post(
+  '/paystack',
+  express.raw({
+    type: 'application/json'
+  }),
+  async (req, res) => {
+    try {
+      const secret =
+        requireGatewayEnv(
+          'PAYSTACK_SECRET_KEY'
+        );
+
+      const signature =
+        req.headers[
+          'x-paystack-signature'
+        ];
+
+      const expected =
+        crypto
+          .createHmac(
+            'sha512',
+            secret
+          )
+          .update(req.body)
+          .digest('hex');
+
+      if (
+        !safeEqual(
+          expected,
+          String(signature || '')
+        )
+      ) {
+        await audit(
+          'webhook_signature_failed',
+          {
+            gateway: 'paystack'
+          }
+        );
+
+        return res.status(401).json({
+          error:
+            'Invalid signature',
+          code:
+            'WEBHOOK_SIGNATURE_INVALID'
+        });
+      }
+
+      const event =
+        JSON.parse(
+          req.body.toString('utf8')
+        );
+
+      const eventId =
+        event.data?.id ||
+        event.data?.reference;
+
+      const claimed =
+        await claimWebhook(
+          'paystack',
+          String(eventId)
+        );
+
+      if (!claimed) {
+        return res.sendStatus(200);
+      }
+
+      if (
+        event.event ===
+        'charge.success'
+      ) {
+        await applyGatewayResult({
+          gateway: 'paystack',
+
+          gatewayPaymentId:
+            event.data.reference,
+
+          status: 'paid',
+
+          amount:
+            event.data.amount,
+
+          currency:
+            event.data.currency,
+
+          raw:
+            event.data
+        });
+      }
+
+      if (
+        event.event ===
+        'charge.failed'
+      ) {
+        await applyGatewayResult({
+          gateway: 'paystack',
+
+          gatewayPaymentId:
+            event.data.reference,
+
+          status: 'failed',
+
+          raw:
+            event.data
+        });
+      }
+
+      return res.sendStatus(200);
+    } catch (err) {
+      return res.status(
+        err.status || 400
+      ).json({
+        error: err.message,
+        code: err.code
+      });
+    }
+  }
+);
+
+// ============================================================================
+// 22. FLUTTERWAVE WEBHOOK
+// ============================================================================
+
+webhookRouter.post(
+  '/flutterwave',
+  express.raw({
+    type: 'application/json'
+  }),
+  async (req, res) => {
+    try {
+      const secret =
+        requireGatewayEnv(
+          'FLUTTERWAVE_SECRET_KEY'
+        );
+
+      const signature =
+        req.headers['verif-hash'];
+
+      if (
+        !signature ||
+        !safeEqual(
+          String(signature),
+          secret
+        )
+      ) {
+        await audit(
+          'webhook_signature_failed',
+          {
+            gateway: 'flutterwave'
+          }
+        );
+
+        return res.status(401).json({
+          error:
+            'Invalid signature',
+          code:
+            'WEBHOOK_SIGNATURE_INVALID'
+        });
+      }
+
+      const event =
+        JSON.parse(
+          req.body.toString('utf8')
+        );
+
+      const data =
+        event.data || event;
+
+      const eventId =
+        data.id ||
+        data.tx_ref;
+
+      const claimed =
+        await claimWebhook(
+          'flutterwave',
+          String(eventId)
+        );
+
+      if (!claimed) {
+        return res.json({
+          status: 'success',
+          duplicate: true
+        });
+      }
+
+      let status = null;
+
+      if (
+        data.status === 'successful' ||
+        event.event ===
+          'charge.completed'
+      ) {
+        status = 'paid';
+      } else if (
+        data.status === 'failed'
+      ) {
+        status = 'failed';
+      }
+
+      if (status) {
+        await applyGatewayResult({
+          gateway: 'flutterwave',
+
+          gatewayPaymentId:
+            data.tx_ref || data.id,
+
+          status,
+
+          amount:
+            data.amount
+              ? Math.round(
+                  Number(data.amount) * 100
+                )
+              : undefined,
+
+          currency:
+            data.currency,
+
+          raw: data
+        });
+      }
+
+      return res.json({
+        status: 'success'
+      });
+    } catch (err) {
+      return res.status(
+        err.status || 400
+      ).json({
+        error: err.message,
+        code: err.code
+      });
+    }
+  }
+);
+
+// ============================================================================
+// 23. PAYPAL WEBHOOK
+// ============================================================================
+
+async function verifyPayPalWebhook(
+  req
+) {
+  const webhookId =
+    requireEnv(
+      'PAYPAL_WEBHOOK_ID'
+    );
+
+  const {
+    token,
+    base
+  } = await getPayPalAccessToken();
+
+  const body =
+    req.body.toString('utf8');
+
+  const headers = {
+    transmission_id:
+      req.headers[
+        'paypal-transmission-id'
+      ],
+
+    transmission_time:
+      req.headers[
+        'paypal-transmission-time'
+      ],
+
+    cert_url:
+      req.headers[
+        'paypal-cert-url'
+      ],
+
+    auth_algo:
+      req.headers[
+        'paypal-auth-algo'
+      ],
+
+    transmission_sig:
+      req.headers[
+        'paypal-transmission-sig'
+      ]
+  };
+
+  for (const [name, value] of Object.entries(
+    headers
+  )) {
+    if (!value) {
+      throw new Error(
+        `Missing PayPal webhook header: ${name}`
+      );
+    }
+  }
+
+  const response =
+    await fetch(
+      `${base}/v1/notifications/verify-webhook-signature`,
+      {
+        method: 'POST',
+
+        headers: {
+          Authorization:
+            `Bearer ${token}`,
+
+          'Content-Type':
+            'application/json'
+        },
+
+        body: JSON.stringify({
+          transmission_id:
+            headers.transmission_id,
+
+          transmission_time:
+            headers.transmission_time,
+
+          cert_url:
+            headers.cert_url,
+
+          auth_algo:
+            headers.auth_algo,
+
+          transmission_sig:
+            headers.transmission_sig,
+
+          webhook_id:
+            webhookId,
+
+          webhook_event:
+            JSON.parse(body)
+        })
+      }
+    );
+
+  const result =
+    await response.json();
+
+  return (
+    response.ok &&
+    result.verification_status ===
+      'SUCCESS'
+  );
+}
+
+webhookRouter.post(
+  '/paypal',
+  express.raw({
+    type: 'application/json'
+  }),
+  async (req, res) => {
+    try {
+      const valid =
+        await verifyPayPalWebhook(req);
+
+      if (!valid) {
+        await audit(
+          'webhook_signature_failed',
+          {
+            gateway: 'paypal'
+          }
+        );
+
+        return res.status(401).json({
+          error:
+            'Invalid PayPal webhook signature',
+          code:
+            'WEBHOOK_SIGNATURE_INVALID'
+        });
+      }
+
+      const event =
+        JSON.parse(
+          req.body.toString('utf8')
+        );
+
+      const claimed =
+        await claimWebhook(
+          'paypal',
+          event.id
+        );
+
+      if (!claimed) {
+        return res.sendStatus(200);
+      }
+
+      const resource =
+        event.resource || {};
+
+      /*
+       * IMPORTANT:
+       * ORDER.APPROVED is NOT treated as paid.
+       * Capture completion is required.
+       */
+
+      if (
+        event.event_type ===
+        'PAYMENT.CAPTURE.COMPLETED'
+      ) {
+        await applyGatewayResult({
+          gateway: 'paypal',
+
+          gatewayPaymentId:
+            resource.order_id ||
+            resource.id,
+
+          status: 'paid',
+
+          amount:
+            resource.amount?.value
+              ? Math.round(
+                  Number(
+                    resource.amount.value
+                  ) * 100
+                )
+              : undefined,
+
+          currency:
+            resource.amount?.currency_code,
+
+          raw:
+            resource
+        });
+      }
+
+      if (
+        event.event_type ===
+          'PAYMENT.CAPTURE.DENIED' ||
+        event.event_type ===
+          'CHECKOUT.ORDER.VOIDED'
+      ) {
+        await applyGatewayResult({
+          gateway: 'paypal',
+
+          gatewayPaymentId:
+            resource.order_id ||
+            resource.id,
+
+          status: 'failed',
+
+          raw:
+            resource
+        });
+      }
+
+      return res.sendStatus(200);
+    } catch (err) {
+      return res.status(
+        err.status || 400
+      ).json({
+        error: err.message,
+        code: err.code
+      });
+    }
+  }
+);
+
+// ============================================================================
+// 24. RAZORPAY WEBHOOK
+// ============================================================================
+
+webhookRouter.post(
+  '/razorpay',
+  express.raw({
+    type: 'application/json'
+  }),
+  async (req, res) => {
+    try {
+      const secret =
+        requireGatewayEnv(
+          'RAZORPAY_KEY_SECRET'
+        );
+
+      const signature =
+        req.headers[
+          'x-razorpay-signature'
+        ];
+
+      const expected =
+        crypto
+          .createHmac(
+            'sha256',
+            secret
+          )
+          .update(req.body)
+          .digest('hex');
+
+      if (
+        !safeEqual(
+          expected,
+          String(signature || '')
+        )
+      ) {
+        await audit(
+          'webhook_signature_failed',
+          {
+            gateway: 'razorpay'
+          }
+        );
+
+        return res.status(401).json({
+          error:
+            'Invalid signature',
+          code:
+            'WEBHOOK_SIGNATURE_INVALID'
+        });
+      }
+
+      const event =
+        JSON.parse(
+          req.body.toString('utf8')
+        );
+
+      const entity =
+        event.payload?.payment?.entity ||
+        event.payload?.order?.entity ||
+        {};
+
+      const eventId =
+        event.event_id ||
+        entity.id;
+
+      const claimed =
+        await claimWebhook(
+          'razorpay',
+          String(eventId)
+        );
+
+      if (!claimed) {
+        return res.json({
+          status: 'ok',
+          duplicate: true
+        });
+      }
+
+      if (
+        event.event ===
+          'payment.captured' ||
+        event.event ===
+          'order.paid'
+      ) {
+        await applyGatewayResult({
+          gateway: 'razorpay',
+
+          gatewayPaymentId:
+            entity.order_id ||
+            entity.id,
+
+          status: 'paid',
+
+          amount:
+            entity.amount,
+
+          currency:
+            entity.currency,
+
+          raw:
+            entity
+        });
+      }
+
+      if (
+        event.event ===
+        'payment.failed'
+      ) {
+        await applyGatewayResult({
+          gateway: 'razorpay',
+
+          gatewayPaymentId:
+            entity.order_id ||
+            entity.id,
+
+          status: 'failed',
+
+          raw:
+            entity
+        });
+      }
+
+      return res.json({
+        status: 'ok'
+      });
+    } catch (err) {
+      return res.status(
+        err.status || 400
+      ).json({
+        error: err.message,
+        code: err.code
+      });
+    }
+  }
+);
+
+// ============================================================================
+// 25. EXPRESS
+// ============================================================================
+
+const app =
+  express();
+
+app.disable('x-powered-by');
+
+app.set(
+  'trust proxy',
+  1
+);
+
+app.use(
+  helmet({
+    contentSecurityPolicy: false
+  })
+);
+
+app.use(
+  cors({
+    origin: (
+      origin,
+      callback
+    ) => {
+      if (
+        !origin ||
+        ALLOWED_ORIGINS.includes(origin)
+      ) {
+        return callback(
+          null,
+          true
+        );
+      }
+
+      return callback(
+        new Error(
+          'CORS: origin not allowed'
+        )
+      );
+    },
+
+    credentials: true
+  })
+);
+
+app.use(
+  rateLimit({
+    windowMs:
+      Number(
+        process.env
+          .RATE_LIMIT_WINDOW_MS
+      ) || 60000,
+
+    max:
+      Number(
+        process.env
+          .RATE_LIMIT_MAX
+      ) || 100,
+
+    standardHeaders: true,
+    legacyHeaders: false,
+
+    handler: (
+      _req,
+      res
+    ) =>
+      res.status(429).json({
+        error:
+          'Rate limit exceeded',
+        code:
+          'RATE_LIMIT'
+      })
+  })
+);
+
+/*
+ * Webhooks MUST be mounted before express.json()
+ * so gateway signature verification receives
+ * the original raw request body.
+ */
+app.use(
+  '/webhooks',
+  webhookRouter
+);
+
+app.use(
+  express.json({
+    limit: '256kb'
+  })
+);
+
+// ============================================================================
+// 26. HEALTH
+// ============================================================================
+
+app.get(
+  '/health',
+  (_req, res) => {
+    res.json({
+      status: 'ok',
+      service: 'paypaddy',
+      ts:
+        new Date().toISOString()
+    });
+  }
+);
+
+// ============================================================================
+// 27. PARTNER TOKEN
+// ============================================================================
+
+app.post(
+  '/oauth/token',
+  async (req, res) => {
+    try {
+      const token =
+        await issueClientCredentialsToken(
+          req.body
+        );
+
+      return res.json(token);
+    } catch (err) {
+      return res.status(
+        err.status || 400
+      ).json({
+        error:
+          err.message,
+        code:
+          err.code
+      });
+    }
+  }
+);
+
+// ============================================================================
+// 28. CREATE PAYMENT
+// ============================================================================
+
+app.post(
+  '/api/v1/payments',
+  requireAnyAuth,
+  async (req, res) => {
+    try {
+      const actor =
+        req.authType === 'partner'
+          ? {
+              type: 'partner',
+              id:
+                req.partner.partnerId,
+              scopes:
+                req.partner.scopes
+            }
+          : {
+              type: 'user',
+              id:
+                req.user.uid
+            };
+
+      if (
+        actor.type === 'partner' &&
+        !(
+          actor.scopes || []
+        ).includes(
+          'payments:create'
+        )
+      ) {
+        return res.status(403).json({
+          error:
+            'Scope payments:create required',
+          code:
+            'INSUFFICIENT_SCOPE'
+        });
+      }
+
+      const result =
+        await createPaymentSession(
+          actor,
+          req.body
+        );
+
+      return res.status(201).json(
+        result
+      );
+    } catch (err) {
+      console.error(
+        '[payments/create]',
+        err.message
+      );
+
+      return res.status(
+        err.status || 500
+      ).json({
+        error:
+          err.message,
+        code:
+          err.code || 'INTERNAL'
+      });
+    }
+  }
+);
+
+// ============================================================================
+// 29. PAYMENT LOOKUP
+// ============================================================================
+
+async function getSession(id) {
+  const doc =
+    await db
+      .collection('payment_sessions')
+      .doc(id)
+      .get();
+
+  return doc.exists
+    ? {
+        id: doc.id,
+        ...doc.data()
+      }
+    : null;
+}
+
+async function listSessionsForUser(
+  userId
+) {
+  const snapshot =
+    await db
+      .collection('payment_sessions')
+      .where(
+        'userId',
+        '==',
+        userId
+      )
+      .orderBy(
+        'createdAt',
+        'desc'
+      )
+      .limit(50)
+      .get();
+
+  return snapshot.docs.map(
+    doc => ({
+      id: doc.id,
+      ...doc.data()
+    })
+  );
+}
+
+async function listSessionsForPartner(
+  partnerId
+) {
+  const snapshot =
+    await db
+      .collection('payment_sessions')
+      .where(
+        'partnerId',
+        '==',
+        partnerId
+      )
+      .orderBy(
+        'createdAt',
+        'desc'
+      )
+      .limit(50)
+      .get();
+
+  return snapshot.docs.map(
+    doc => ({
+      id: doc.id,
+      ...doc.data()
+    })
+  );
+}
+
+async function getReceipt(id) {
+  const doc =
+    await db
+      .collection('receipts')
+      .doc(id)
+      .get();
+
+  return doc.exists
+    ? {
+        id: doc.id,
+        ...doc.data()
+      }
+    : null;
+}
+
+// ============================================================================
+// 30. LIST PAYMENTS
+// ============================================================================
+
+app.get(
+  '/api/v1/payments',
+  requireAnyAuth,
+  async (req, res) => {
+    try {
+      let payments;
+
+      if (
+        req.authType ===
+        'partner'
+      ) {
+        if (
+          !(
+            req.partner.scopes || []
+          ).includes(
+            'payments:read'
+          )
+        ) {
+          return res.status(403).json({
+            error:
+              'Scope payments:read required',
+            code:
+              'INSUFFICIENT_SCOPE'
+          });
+        }
+
+        payments =
+          await listSessionsForPartner(
+            req.partner.partnerId
+          );
+      } else {
+        payments =
+          await listSessionsForUser(
+            req.user.uid
+          );
+      }
+
+      return res.json({
+        payments
+      });
+    } catch (err) {
+      return res.status(500).json({
+        error:
+          'Unable to retrieve payments',
+        code:
+          'INTERNAL'
+      });
+    }
+  }
+);
+
+// ============================================================================
+// 31. PAYMENT DETAILS
+// ============================================================================
+
+app.get(
+  '/api/v1/payments/:id',
+  requireAnyAuth,
+  async (req, res) => {
+    try {
+      const session =
+        await getSession(
+          req.params.id
+        );
+
+      if (!session) {
+        return res.status(404).json({
+          error:
+            'Payment session not found',
+          code:
+            'NOT_FOUND'
+        });
+      }
+
+      if (
+        req.authType ===
+        'partner'
+      ) {
+        if (
+          session.partnerId !==
+          req.partner.partnerId
+        ) {
+          await audit(
+            'partner_isolation_violation',
+            {
+              partnerId:
+                req.partner.partnerId,
+              resourcePartnerId:
+                session.partnerId,
+              sessionId:
+                session.id
+            }
+          );
+
+          return res.status(403).json({
+            error:
+              'Forbidden',
+            code:
+              'PARTNER_ISOLATION'
+          });
+        }
+      } else if (
+        session.userId !==
+        req.user.uid
+      ) {
+        return res.status(403).json({
+          error:
+            'Forbidden',
+          code:
+            'FORBIDDEN'
+        });
+      }
+
+      return res.json(
+        session
+      );
+    } catch (err) {
+      return res.status(
+        err.status || 500
+      ).json({
+        error:
+          err.message,
+        code:
+          err.code || 'INTERNAL'
+      });
+    }
+  }
+);
+
+// ============================================================================
+// 32. RECEIPTS
+// ============================================================================
+
+app.get(
+  '/api/v1/receipts/:id',
+  requireAnyAuth,
+  async (req, res) => {
+    try {
+      const receipt =
+        await getReceipt(
+          req.params.id
+        );
+
+      if (!receipt) {
+        return res.status(404).json({
+          error:
+            'Receipt not found',
+          code:
+            'NOT_FOUND'
+        });
+      }
+
+      if (
+        req.authType ===
+        'partner'
+      ) {
+        if (
+          receipt.partnerId !==
+          req.partner.partnerId
+        ) {
+          return res.status(403).json({
+            error:
+              'Forbidden',
+            code:
+              'PARTNER_ISOLATION'
+          });
+        }
+      } else if (
+        receipt.userId !==
+        req.user.uid
+      ) {
+        return res.status(403).json({
+          error:
+            'Forbidden',
+          code:
+            'FORBIDDEN'
+        });
+      }
+
+      return res.json(
+        receipt
+      );
+    } catch (err) {
+      return res.status(
+        err.status || 500
+      ).json({
+        error:
+          err.message,
+        code:
+          err.code || 'INTERNAL'
+      });
+    }
+  }
+);
+
+// ============================================================================
+// 33. ERROR HANDLING
+// ============================================================================
+
+app.use(
+  (
+    err,
+    _req,
+    res,
+    _next
+  ) => {
+    console.error(
+      '[unhandled]',
+      err
+    );
+
+    return res.status(500).json({
+      error:
+        'Internal server error',
+      code:
+        'INTERNAL'
+    });
+  }
+);
+
+app.use(
+  (_req, res) =>
+    res.status(404).json({
+      error:
+        'Not found',
+      code:
+        'NOT_FOUND'
+    })
+);
+
+// ============================================================================
+// 34. START
+// ============================================================================
+
+app.listen(
+  PORT,
+  () => {
+    console.log(
+      `PayPaddy API listening on :${PORT}`
+    );
+
+    console.log(
+      `Firebase project: ${FIREBASE_PROJECT_ID}`
+    );
+
+    audit(
+      'server_started',
+      {
+        port: PORT,
+        env: NODE_ENV
+      }
+    ).catch(
+      err =>
+        console.error(
+          '[audit/startup]',
+          err.message
+        )
+    );
+  }
+);
