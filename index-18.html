@@ -1,0 +1,884 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PayPaddy – Secure Payments</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #f0f4f8;
+      --card: #ffffff;
+      --primary: #2563eb;
+      --primary-dark: #1d4ed8;
+      --text: #0f172a;
+      --muted: #64748b;
+      --border: #e2e8f0;
+      --success: #16a34a;
+      --danger: #dc2626;
+      --warning: #d97706;
+      --radius: 12px;
+      --shadow: 0 4px 24px rgba(15,23,42,.08);
+      --font: 'Inter', system-ui, sans-serif;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.5;
+    }
+    .hidden { display: none !important; }
+
+    /* Top nav */
+    .topnav {
+      background: #fff;
+      border-bottom: 1px solid var(--border);
+      padding: 12px 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky; top: 0; z-index: 40;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; text-decoration: none; color: var(--text); }
+    .brand-mark {
+      width: 36px; height: 36px; border-radius: 10px;
+      background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+      display: grid; place-items: center; color: #fff; font-weight: 800;
+    }
+    .brand small { display: block; font-size: 11px; font-weight: 500; color: var(--muted); }
+    .nav-links { display: flex; gap: 22px; }
+    .nav-links a { color: var(--muted); text-decoration: none; font-size: 14px; font-weight: 500; }
+    .nav-links a:hover, .nav-links a.active { color: var(--primary); }
+    .user-chip { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+    .avatar {
+      width: 36px; height: 36px; border-radius: 50%;
+      background: var(--primary); color: #fff;
+      display: grid; place-items: center; font-weight: 700; font-size: 13px;
+    }
+
+    /* Layout: split after login is dashboard; before is auth */
+    .shell { max-width: 1200px; margin: 0 auto; padding: 28px 20px 60px; }
+
+    /* AUTH pages */
+    .auth-wrap {
+      display: grid;
+      grid-template-columns: 1fr 1.2fr;
+      gap: 28px;
+      align-items: start;
+      min-height: calc(100vh - 120px);
+    }
+    @media (max-width: 900px) { .auth-wrap { grid-template-columns: 1fr; } }
+
+    .auth-panel {
+      background: var(--card);
+      border-radius: 16px;
+      padding: 36px 32px;
+      box-shadow: var(--shadow);
+      border: 1px solid var(--border);
+    }
+    .auth-badge {
+      display: inline-block;
+      background: #eff6ff;
+      color: var(--primary);
+      font-size: 12px;
+      font-weight: 600;
+      padding: 4px 12px;
+      border-radius: 999px;
+      margin-bottom: 16px;
+    }
+    .auth-panel h1 { font-size: 28px; margin-bottom: 8px; }
+    .auth-panel .sub { color: var(--muted); font-size: 14px; margin-bottom: 28px; }
+
+    .field { margin-bottom: 16px; }
+    .field label { display: block; font-size: 13px; font-weight: 500; color: var(--muted); margin-bottom: 6px; }
+    .field input, .field select {
+      width: 100%;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-size: 15px;
+      font-family: inherit;
+      outline: none;
+      background: #fff;
+    }
+    .field input:focus, .field select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37,99,235,.12); }
+    .pw-wrap { position: relative; }
+    .pw-wrap input { padding-right: 44px; }
+    .eye-btn {
+      position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+      background: none; border: none; cursor: pointer; color: var(--muted); font-size: 16px;
+    }
+
+    .row-between { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; font-size: 13px; }
+    .row-between a { color: var(--primary); text-decoration: none; }
+    .check { display: flex; align-items: center; gap: 8px; color: var(--muted); cursor: pointer; }
+
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+      padding: 12px 22px; border-radius: 10px; font-weight: 600; font-size: 15px;
+      border: none; cursor: pointer; font-family: inherit; transition: .15s;
+    }
+    .btn-primary { background: linear-gradient(135deg, #3b82f6, #2563eb); color: #fff; width: 100%; }
+    .btn-primary:hover { filter: brightness(1.05); }
+    .btn-primary:disabled { opacity: .6; cursor: not-allowed; }
+    .btn-outline {
+      background: #fff; border: 1px solid var(--border); color: var(--text); width: 100%;
+    }
+    .btn-outline:hover { border-color: var(--primary); color: var(--primary); }
+    .btn-ghost { background: transparent; color: var(--muted); padding: 8px 14px; font-size: 13px; }
+    .btn-ghost:hover { color: var(--text); }
+
+    .or { text-align: center; color: var(--muted); font-size: 13px; margin: 18px 0; position: relative; }
+    .or::before, .or::after {
+      content: ''; position: absolute; top: 50%; width: 38%; height: 1px; background: var(--border);
+    }
+    .or::before { left: 0; } .or::after { right: 0; }
+
+    .auth-footer { text-align: center; margin-top: 20px; font-size: 14px; color: var(--muted); }
+    .auth-footer a { color: var(--primary); font-weight: 600; text-decoration: none; }
+
+    .features-side {
+      display: flex; flex-direction: column; gap: 16px; justify-content: center; padding: 20px;
+    }
+    .feat-item {
+      display: flex; gap: 14px; align-items: flex-start;
+      background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+      padding: 18px; box-shadow: var(--shadow);
+    }
+    .feat-icon {
+      width: 44px; height: 44px; border-radius: 12px; background: #eff6ff;
+      display: grid; place-items: center; font-size: 20px; flex-shrink: 0;
+    }
+    .feat-item h3 { font-size: 15px; margin-bottom: 4px; }
+    .feat-item p { font-size: 13px; color: var(--muted); }
+
+    /* DASHBOARD / PAY */
+    .dash-grid { display: grid; gap: 24px; }
+    .welcome { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 12px; }
+    .welcome h1 { font-size: 24px; }
+    .welcome p { color: var(--muted); font-size: 14px; }
+
+    .pay-banner {
+      background: linear-gradient(135deg, #1e40af, #3b82f6);
+      border-radius: 16px; padding: 28px 32px; color: #fff;
+      display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;
+    }
+    .pay-banner .label { font-size: 13px; opacity: .85; }
+    .pay-banner .amount { font-size: 40px; font-weight: 800; margin: 6px 0 10px; }
+    .pay-banner .amount small { font-size: 16px; font-weight: 500; opacity: .85; }
+    .pay-banner .meta { display: flex; gap: 20px; flex-wrap: wrap; font-size: 13px; opacity: .9; }
+    .secure-pill {
+      background: rgba(255,255,255,.15); border: 1px solid rgba(255,255,255,.3);
+      border-radius: 12px; padding: 10px 14px; font-size: 11px; font-weight: 700; letter-spacing: .04em; text-align: center;
+    }
+
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+      padding: 22px; box-shadow: var(--shadow);
+    }
+    .card h2 { font-size: 16px; margin-bottom: 16px; }
+    .section-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+    .section-head h2 { margin: 0; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+    td { padding: 12px; border-bottom: 1px solid var(--border); }
+    .status {
+      display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+    }
+    .status.paid { background: #dcfce7; color: var(--success); }
+    .status.failed, .status.cancelled, .status.expired { background: #fee2e2; color: var(--danger); }
+    .status.pending { background: #fef3c7; color: var(--warning); }
+
+    .gw-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px;
+    }
+    .gw-item {
+      border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;
+      font-size: 13px; font-weight: 600;
+    }
+    .gw-item small { display: block; font-weight: 400; color: var(--muted); font-size: 11px; }
+
+    .pay-form .field { margin-bottom: 14px; }
+
+    /* Modal */
+    .modal {
+      position: fixed; inset: 0; z-index: 100;
+      display: grid; place-items: center;
+    }
+    .modal-bg { position: absolute; inset: 0; background: rgba(15,23,42,.45); backdrop-filter: blur(3px); }
+    .modal-card {
+      position: relative; background: #fff; border-radius: 16px; padding: 28px;
+      width: 90%; max-width: 400px; box-shadow: 0 20px 60px rgba(0,0,0,.2); z-index: 1;
+    }
+    .modal-close {
+      position: absolute; top: 12px; right: 14px; background: none; border: none;
+      font-size: 22px; color: var(--muted); cursor: pointer;
+    }
+    .modal-amount { font-size: 32px; font-weight: 800; text-align: center; margin: 12px 0 20px; }
+    .methods { display: flex; flex-direction: column; gap: 8px; margin-bottom: 20px; }
+    .method {
+      display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+      border: 1px solid var(--border); border-radius: 10px; cursor: pointer; font-size: 14px;
+    }
+    .method:has(input:checked) { border-color: var(--primary); background: #eff6ff; }
+    .pay-status {
+      margin-top: 14px; padding: 12px; border-radius: 10px; text-align: center; font-size: 14px;
+    }
+    .pay-status.pending { background: #fef3c7; color: var(--warning); }
+    .pay-status.error { background: #fee2e2; color: var(--danger); }
+    .pay-status.success { background: #dcfce7; color: var(--success); }
+
+    .receipt-details { background: #f8fafc; border-radius: 10px; padding: 14px; margin: 16px 0; font-size: 14px; }
+    .receipt-details div { display: flex; justify-content: space-between; padding: 5px 0; }
+    .receipt-details .lbl { color: var(--muted); }
+
+    .toast {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+      background: #0f172a; color: #fff; padding: 12px 22px; border-radius: 10px;
+      font-size: 14px; font-weight: 500; z-index: 200; box-shadow: var(--shadow);
+    }
+
+    .footer {
+      text-align: center; padding: 24px; font-size: 12px; color: var(--muted);
+      border-top: 1px solid var(--border); margin-top: 40px;
+    }
+    .footer span { font-weight: 600; color: var(--text); }
+
+    .error-banner {
+      background: #fee2e2; color: var(--danger); padding: 12px 16px; border-radius: 10px;
+      font-size: 14px; margin-bottom: 16px;
+    }
+    .empty { text-align: center; color: var(--muted); padding: 24px; font-size: 14px; }
+  </style>
+</head>
+<body>
+
+  <!-- ========== TOP NAV ========== -->
+  <header class="topnav">
+    <a href="#" class="brand" onclick="showView('auth')">
+      <span class="brand-mark">P</span>
+      <span>PayPaddy<small>Secure Payments. Global Reach.</small></span>
+    </a>
+    <nav class="nav-links" id="navLinks">
+      <a href="#" class="active" data-nav="home">Home</a>
+      <a href="#" data-nav="payments">Payments</a>
+      <a href="#" data-nav="transactions">Transactions</a>
+    </nav>
+    <div class="user-chip hidden" id="userChip">
+      <div class="avatar" id="avatar">—</div>
+      <span id="userName">User</span>
+      <button class="btn-ghost" onclick="logout()">Sign Out</button>
+    </div>
+  </header>
+
+  <div class="shell">
+
+    <!-- ========== AUTH (register / login) ========== -->
+    <div id="view-auth" class="auth-wrap">
+      <div class="auth-panel">
+        <span class="auth-badge">External Payment Portal</span>
+        <div id="authError" class="error-banner hidden"></div>
+
+        <!-- Login form -->
+        <div id="form-login">
+          <h1>Welcome Back</h1>
+          <p class="sub">Sign in to access your payment dashboard and manage your transactions.</p>
+          <form onsubmit="doLogin(event)">
+            <div class="field">
+              <label>Email Address</label>
+              <input type="email" id="loginEmail" placeholder="you@yourdomain.com" required autocomplete="email" />
+            </div>
+            <div class="field">
+              <label>Password</label>
+              <div class="pw-wrap">
+                <input type="password" id="loginPassword" placeholder="Enter your password" required autocomplete="current-password" />
+                <button type="button" class="eye-btn" onclick="togglePw('loginPassword')">👁</button>
+              </div>
+            </div>
+            <div class="row-between">
+              <label class="check"><input type="checkbox" id="rememberMe" /> Remember me</label>
+              <a href="#" onclick="doForgot(event)">Forgot password?</a>
+            </div>
+            <button type="submit" class="btn btn-primary" id="loginBtn">Sign In →</button>
+          </form>
+          <div class="or">or continue with</div>
+          <button class="btn btn-outline" onclick="doGoogle()">
+            <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" width="18" alt="" />
+            Sign in with Google
+          </button>
+          <p class="auth-footer">Don't have an account? <a href="#" onclick="switchAuth('register')">Create account</a></p>
+        </div>
+
+        <!-- Register form -->
+        <div id="form-register" class="hidden">
+          <h1>Create Account</h1>
+          <p class="sub">Register to start accepting and making payments securely.</p>
+          <form onsubmit="doRegister(event)">
+            <div class="field">
+              <label>Full Name</label>
+              <input type="text" id="regName" placeholder="John Doe" required autocomplete="name" />
+            </div>
+            <div class="field">
+              <label>Email Address</label>
+              <input type="email" id="regEmail" placeholder="you@yourdomain.com" required autocomplete="email" />
+            </div>
+            <div class="field">
+              <label>Password</label>
+              <div class="pw-wrap">
+                <input type="password" id="regPassword" placeholder="Min. 8 characters" minlength="8" required autocomplete="new-password" />
+                <button type="button" class="eye-btn" onclick="togglePw('regPassword')">👁</button>
+              </div>
+            </div>
+            <div class="field">
+              <label>Confirm Password</label>
+              <input type="password" id="regPassword2" placeholder="Repeat password" required autocomplete="new-password" />
+            </div>
+            <button type="submit" class="btn btn-primary" id="regBtn">Create Account →</button>
+          </form>
+          <div class="or">or continue with</div>
+          <button class="btn btn-outline" onclick="doGoogle()">
+            <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" width="18" alt="" />
+            Sign up with Google
+          </button>
+          <p class="auth-footer">Already have an account? <a href="#" onclick="switchAuth('login')">Sign In</a></p>
+        </div>
+      </div>
+
+      <div class="features-side">
+        <div class="feat-item">
+          <div class="feat-icon">⚡</div>
+          <div><h3>Fast Processing</h3><p>Create a payment session and redirect to your preferred gateway in seconds.</p></div>
+        </div>
+        <div class="feat-item">
+          <div class="feat-icon">🛡️</div>
+          <div><h3>Defense-in-depth security</h3><p>Identity, authorization, partner isolation, webhook verification, and audit logging.</p></div>
+        </div>
+        <div class="feat-item">
+          <div class="feat-icon">🌍</div>
+          <div><h3>Global Coverage</h3><p>Stripe, Paystack, PayPal, Flutterwave, Razorpay, Square and more.</p></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ========== DASHBOARD (after auth) ========== -->
+    <div id="view-dashboard" class="dash-grid hidden">
+      <div class="welcome">
+        <div>
+          <h1>Welcome back, <span id="welcomeName">User</span> 👋</h1>
+          <p>Here's your payment summary.</p>
+        </div>
+      </div>
+
+      <div class="pay-banner">
+        <div>
+          <div class="label">Amount to Pay</div>
+          <div class="amount">$49.00 <small>USD</small></div>
+          <div class="meta">
+            <span>📄 Invoice ready</span>
+            <span>📅 Due today</span>
+          </div>
+        </div>
+        <div class="secure-pill">SECURE<br>PAYMENT</div>
+      </div>
+
+      <button class="btn btn-primary" style="width:auto;padding:14px 32px" onclick="openPayModal()">🔒 Pay Now</button>
+
+      <!-- Create custom payment -->
+      <div class="card" id="panel-payments">
+        <h2>Create Payment Session</h2>
+        <form class="pay-form" onsubmit="createCustomPayment(event)">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+            <div class="field">
+              <label>Amount (USD)</label>
+              <input type="number" id="payAmount" step="0.01" min="0.50" value="49.00" required />
+            </div>
+            <div class="field">
+              <label>Gateway</label>
+              <select id="payGateway">
+                <option value="stripe">Stripe</option>
+                <option value="paystack">Paystack</option>
+                <option value="paypal">PayPal</option>
+                <option value="flutterwave">Flutterwave</option>
+                <option value="razorpay">Razorpay</option>
+                <option value="square">Square</option>
+              </select>
+            </div>
+          </div>
+          <div class="field">
+            <label>Reference / Invoice ID</label>
+            <input type="text" id="payRef" placeholder="INV-2026-xxxxx" />
+          </div>
+          <div class="field">
+            <label>Description</label>
+            <input type="text" id="payDesc" placeholder="What is this payment for?" />
+          </div>
+          <button type="submit" class="btn btn-primary" style="width:auto" id="createPayBtn">Generate Payment Session</button>
+        </form>
+        <div id="payResult" class="hidden" style="margin-top:14px;padding:14px;background:#f8fafc;border-radius:10px;font-size:14px;word-break:break-all"></div>
+      </div>
+
+      <div class="card">
+        <div class="section-head">
+          <h2>Recent Payments</h2>
+        </div>
+        <table>
+          <thead>
+            <tr><th>Date</th><th>Reference</th><th>Gateway</th><th>Amount</th><th>Status</th></tr>
+          </thead>
+          <tbody id="paymentsBody">
+            <tr><td colspan="5" class="empty">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <div class="section-head"><h2>Payment Gateways</h2></div>
+        <p style="color:var(--muted);font-size:13px;margin-bottom:14px">Sessions are created against real gateway APIs. Success only after verified webhook.</p>
+        <div class="gw-grid">
+          <div class="gw-item">Stripe<small>Global</small></div>
+          <div class="gw-item">Paystack<small>Africa</small></div>
+          <div class="gw-item">PayPal<small>Global</small></div>
+          <div class="gw-item">Flutterwave<small>Africa & Global</small></div>
+          <div class="gw-item">Razorpay<small>India & Global</small></div>
+          <div class="gw-item">Square<small>Global</small></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer class="footer">
+    PayPaddy · Defense-in-depth security architecture · SSL/TLS required in production<br>
+    © 2026 PayPaddy. All rights reserved.
+  </footer>
+
+  <!-- Pay modal -->
+  <div id="payModal" class="modal hidden">
+    <div class="modal-bg" onclick="closePayModal()"></div>
+    <div class="modal-card">
+      <button class="modal-close" onclick="closePayModal()">×</button>
+      <h2 style="text-align:center">Complete Payment</h2>
+      <div class="modal-amount" id="modalAmount">$49.00 USD</div>
+      <div class="methods">
+        <label class="method"><input type="radio" name="method" value="stripe" checked /> Card (Stripe)</label>
+        <label class="method"><input type="radio" name="method" value="paystack" /> Paystack</label>
+        <label class="method"><input type="radio" name="method" value="paypal" /> PayPal</label>
+        <label class="method"><input type="radio" name="method" value="flutterwave" /> Flutterwave</label>
+      </div>
+      <button class="btn btn-primary" id="confirmPayBtn" onclick="startPayment()">🔒 Pay Now</button>
+      <div id="payStatus" class="pay-status hidden"></div>
+    </div>
+  </div>
+
+  <!-- Receipt modal -->
+  <div id="receiptModal" class="modal hidden">
+    <div class="modal-bg" onclick="closeReceipt()"></div>
+    <div class="modal-card" style="text-align:center">
+      <div style="width:64px;height:64px;border-radius:50%;background:#dcfce7;color:var(--success);display:grid;place-items:center;font-size:28px;margin:0 auto 12px">✓</div>
+      <h2>Payment Successful</h2>
+      <p style="color:var(--muted);font-size:14px;margin-top:6px">Confirmed by the payment gateway.</p>
+      <div class="receipt-details" id="receiptDetails"></div>
+      <button class="btn btn-outline" style="width:auto;margin-right:8px" onclick="closeReceipt()">Close</button>
+      <button class="btn btn-primary" style="width:auto" onclick="downloadReceipt()">Download</button>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <!-- Firebase -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+  <script>
+  /* ================================================================
+     CONFIG – replace with your real values. No placeholders in prod.
+     ================================================================ */
+  const firebaseConfig = {
+    apiKey: "YOUR_API_KEY",
+    authDomain: "YOUR_PROJECT.firebaseapp.com",
+    projectId: "YOUR_PROJECT_ID",
+    storageBucket: "YOUR_PROJECT.appspot.com",
+    messagingSenderId: "YOUR_SENDER_ID",
+    appId: "YOUR_APP_ID"
+  };
+
+  const API_BASE = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+    ? 'http://localhost:3001'
+    : 'https://api.paypaddy.example.com'; // ← your production API
+
+  /* Config guard */
+  (function checkConfig() {
+    const bad = Object.entries(firebaseConfig).filter(([,v]) => !v || String(v).startsWith('YOUR_'));
+    if (bad.length) {
+      console.error('[PayPaddy] Firebase config incomplete:', bad.map(([k]) => k).join(', '));
+    }
+  })();
+
+  if (!firebase.apps.length) firebase.initializeApp(firebaseConfig);
+  const auth = firebase.auth();
+
+  /* ---------- helpers ---------- */
+  function $(id) { return document.getElementById(id); }
+  function showToast(msg) {
+    const t = $('toast');
+    t.textContent = msg;
+    t.classList.remove('hidden');
+    setTimeout(() => t.classList.add('hidden'), 4000);
+  }
+  function togglePw(id) {
+    const el = $(id);
+    el.type = el.type === 'password' ? 'text' : 'password';
+  }
+  function sanitize(s) {
+    const d = document.createElement('div');
+    d.textContent = s == null ? '' : String(s);
+    return d.innerHTML;
+  }
+  function showAuthError(msg) {
+    const el = $('authError');
+    if (!msg) { el.classList.add('hidden'); return; }
+    el.textContent = msg;
+    el.classList.remove('hidden');
+  }
+  function mapAuthError(err) {
+    const c = err.code || '';
+    if (c.includes('email-already-in-use')) return 'Email already registered';
+    if (c.includes('wrong-password') || c.includes('invalid-credential')) return 'Invalid email or password';
+    if (c.includes('user-not-found')) return 'No account for this email';
+    if (c.includes('too-many-requests')) return 'Too many attempts – try later';
+    if (c.includes('popup-closed')) return 'Sign-in popup closed';
+    if (c.includes('network-request-failed')) return 'Network error – check connection';
+    return err.message || 'Authentication failed';
+  }
+
+  async function getIdToken() {
+    const u = auth.currentUser;
+    if (!u) throw new Error('Not authenticated');
+    return u.getIdToken(true);
+  }
+
+  async function api(path, opts = {}) {
+    const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+    try {
+      headers['Authorization'] = 'Bearer ' + await getIdToken();
+    } catch (_) {}
+    const res = await fetch(API_BASE + path, { ...opts, headers, credentials: 'include' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const e = new Error(data.error || data.message || ('HTTP ' + res.status));
+      e.status = res.status;
+      e.code = data.code;
+      throw e;
+    }
+    return data;
+  }
+
+  /* ---------- views ---------- */
+  function showView(name) {
+    $('view-auth').classList.toggle('hidden', name !== 'auth');
+    $('view-dashboard').classList.toggle('hidden', name !== 'dashboard');
+    $('userChip').classList.toggle('hidden', name !== 'dashboard');
+    $('navLinks').style.visibility = name === 'dashboard' ? 'visible' : 'hidden';
+  }
+
+  function switchAuth(which) {
+    showAuthError('');
+    $('form-login').classList.toggle('hidden', which !== 'login');
+    $('form-register').classList.toggle('hidden', which !== 'register');
+  }
+
+  /* ---------- auth ---------- */
+  async function doRegister(e) {
+    e.preventDefault();
+    showAuthError('');
+    const name = $('regName').value.trim();
+    const email = $('regEmail').value.trim();
+    const password = $('regPassword').value;
+    const password2 = $('regPassword2').value;
+    if (password !== password2) { showAuthError('Passwords do not match'); return; }
+    if (password.length < 8) { showAuthError('Password must be at least 8 characters'); return; }
+
+    $('regBtn').disabled = true;
+    try {
+      const cred = await auth.createUserWithEmailAndPassword(email, password);
+      await cred.user.updateProfile({ displayName: name });
+      await cred.user.sendEmailVerification();
+      showToast('Account created – verification email sent');
+      // After successful registration → payment dashboard
+      enterDashboard(cred.user);
+    } catch (err) {
+      showAuthError(mapAuthError(err));
+    } finally {
+      $('regBtn').disabled = false;
+    }
+  }
+
+  async function doLogin(e) {
+    e.preventDefault();
+    showAuthError('');
+    $('loginBtn').disabled = true;
+    try {
+      const cred = await auth.signInWithEmailAndPassword(
+        $('loginEmail').value.trim(),
+        $('loginPassword').value
+      );
+      if (!cred.user.emailVerified) {
+        showToast('Please verify your email when you can');
+      }
+      enterDashboard(cred.user);
+    } catch (err) {
+      showAuthError(mapAuthError(err));
+    } finally {
+      $('loginBtn').disabled = false;
+    }
+  }
+
+  async function doGoogle() {
+    showAuthError('');
+    try {
+      const provider = new firebase.auth.GoogleAuthProvider();
+      const cred = await auth.signInWithPopup(provider);
+      enterDashboard(cred.user);
+    } catch (err) {
+      showAuthError(mapAuthError(err));
+    }
+  }
+
+  async function doForgot(e) {
+    e.preventDefault();
+    const email = $('loginEmail').value.trim();
+    if (!email) { showAuthError('Enter your email above first'); return; }
+    try {
+      await auth.sendPasswordResetEmail(email);
+      showToast('Password reset email sent');
+    } catch (err) {
+      showAuthError(mapAuthError(err));
+    }
+  }
+
+  async function logout() {
+    await auth.signOut();
+    showView('auth');
+    switchAuth('login');
+  }
+
+  function enterDashboard(user) {
+    const name = user.displayName || (user.email || 'User').split('@')[0];
+    const initials = name.split(/\s+/).map(p => p[0]).join('').slice(0, 2).toUpperCase();
+    $('userName').textContent = name;
+    $('welcomeName').textContent = name.split(/\s+/)[0];
+    $('avatar').textContent = initials;
+    showView('dashboard');
+    loadPayments();
+  }
+
+  auth.onAuthStateChanged(user => {
+    if (user) enterDashboard(user);
+    else showView('auth');
+  });
+
+  /* ---------- payments (real only) ---------- */
+  let pollTimer = null;
+  let lastReceipt = null;
+
+  function openPayModal() {
+    $('modalAmount').textContent = '$49.00 USD';
+    $('payStatus').classList.add('hidden');
+    $('confirmPayBtn').disabled = false;
+    $('confirmPayBtn').textContent = '🔒 Pay Now';
+    $('payModal').classList.remove('hidden');
+  }
+  function closePayModal() {
+    $('payModal').classList.add('hidden');
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  async function startPayment() {
+    const gateway = document.querySelector('input[name="method"]:checked')?.value || 'stripe';
+    const statusEl = $('payStatus');
+    const btn = $('confirmPayBtn');
+    btn.disabled = true;
+    btn.textContent = 'Creating session…';
+    statusEl.className = 'pay-status pending';
+    statusEl.textContent = 'Creating secure payment session with gateway…';
+    statusEl.classList.remove('hidden');
+
+    try {
+      const data = await api('/api/v1/payments', {
+        method: 'POST',
+        body: JSON.stringify({
+          amount: 4900,
+          currency: 'usd',
+          gateway,
+          description: 'PayPaddy payment',
+          partnerReferenceId: 'INV-' + Date.now(),
+          idempotencyKey: 'ui_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+          successUrl: location.origin + location.pathname + '?payment=success',
+          cancelUrl: location.origin + location.pathname + '?payment=cancel',
+          email: auth.currentUser?.email
+        })
+      });
+
+      if (data.checkoutUrl) {
+        statusEl.textContent = 'Redirecting to payment gateway…';
+        // Real redirect – success only comes back via webhook + status poll
+        window.location.href = data.checkoutUrl;
+        return;
+      }
+
+      // No redirect URL (e.g. Razorpay client flow) – poll session status
+      statusEl.textContent = 'Waiting for gateway confirmation…';
+      pollSession(data.paymentSessionId);
+    } catch (err) {
+      statusEl.className = 'pay-status error';
+      statusEl.textContent = err.message || 'Payment session failed';
+      btn.disabled = false;
+      btn.textContent = '🔒 Pay Now';
+    }
+  }
+
+  function pollSession(sessionId) {
+    let attempts = 0;
+    pollTimer = setInterval(async () => {
+      attempts++;
+      try {
+        const s = await api('/api/v1/payments/' + sessionId);
+        if (s.status === 'paid') {
+          clearInterval(pollTimer); pollTimer = null;
+          closePayModal();
+          showReceipt(s);
+          loadPayments();
+        } else if (['failed', 'cancelled', 'expired'].includes(s.status)) {
+          clearInterval(pollTimer); pollTimer = null;
+          const el = $('payStatus');
+          el.className = 'pay-status error';
+          el.textContent = 'Payment ' + s.status;
+          $('confirmPayBtn').disabled = false;
+          $('confirmPayBtn').textContent = '🔒 Pay Now';
+        } else if (attempts >= 40) {
+          clearInterval(pollTimer); pollTimer = null;
+          const el = $('payStatus');
+          el.className = 'pay-status pending';
+          el.textContent = 'Still pending. Refresh later or check email.';
+          $('confirmPayBtn').disabled = false;
+          $('confirmPayBtn').textContent = '🔒 Pay Now';
+        }
+      } catch (e) {
+        console.warn('poll', e.message);
+      }
+    }, 3000);
+  }
+
+  async function createCustomPayment(e) {
+    e.preventDefault();
+    const amount = parseFloat($('payAmount').value);
+    const gateway = $('payGateway').value;
+    const ref = $('payRef').value.trim() || undefined;
+    const desc = $('payDesc').value.trim();
+    const btn = $('createPayBtn');
+    btn.disabled = true;
+    try {
+      const data = await api('/api/v1/payments', {
+        method: 'POST',
+        body: JSON.stringify({
+          amount: Math.round(amount * 100),
+          currency: 'usd',
+          gateway,
+          partnerReferenceId: ref,
+          description: desc,
+          idempotencyKey: 'form_' + Date.now(),
+          successUrl: location.origin + location.pathname + '?payment=success',
+          cancelUrl: location.origin + location.pathname + '?payment=cancel',
+          email: auth.currentUser?.email
+        })
+      });
+      const box = $('payResult');
+      box.classList.remove('hidden');
+      box.innerHTML =
+        '<strong>Session created</strong><br>ID: ' + sanitize(data.paymentSessionId) +
+        '<br>Status: ' + sanitize(data.status) +
+        (data.checkoutUrl
+          ? '<br><a href="' + sanitize(data.checkoutUrl) + '" target="_blank" rel="noopener">Open checkout →</a>'
+          : '<br>No redirect URL for this gateway – complete via client SDK.');
+      showToast('Payment session created');
+      loadPayments();
+    } catch (err) {
+      showToast(err.message || 'Failed to create session');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function loadPayments() {
+    const tbody = $('paymentsBody');
+    try {
+      const data = await api('/api/v1/payments');
+      const list = data.payments || [];
+      if (!list.length) {
+        tbody.innerHTML = '<tr><td colspan="5" class="empty">No payments yet</td></tr>';
+        return;
+      }
+      tbody.innerHTML = list.map(p => {
+        const d = p.paidAt || p.createdAt;
+        const date = d ? new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—';
+        const st = p.status || 'pending';
+        return '<tr>' +
+          '<td>' + sanitize(date) + '</td>' +
+          '<td>' + sanitize(p.partnerReferenceId || p.invoiceId || p.id) + '</td>' +
+          '<td>' + sanitize(p.gateway || '—') + '</td>' +
+          '<td>$' + ((p.amount || 0) / 100).toFixed(2) + '</td>' +
+          '<td><span class="status ' + sanitize(st) + '">' + sanitize(st) + '</span></td>' +
+          '</tr>';
+      }).join('');
+    } catch (err) {
+      tbody.innerHTML = '<tr><td colspan="5" class="empty">' + sanitize(err.message) + '</td></tr>';
+    }
+  }
+
+  function showReceipt(s) {
+    lastReceipt = s;
+    $('receiptDetails').innerHTML =
+      '<div><span class="lbl">Amount</span><span>$' + ((s.amount || 0) / 100).toFixed(2) + ' ' + (s.currency || 'usd').toUpperCase() + '</span></div>' +
+      '<div><span class="lbl">Gateway</span><span>' + sanitize(s.gateway) + '</span></div>' +
+      '<div><span class="lbl">Receipt</span><span>' + sanitize(s.receiptId || '—') + '</span></div>' +
+      '<div><span class="lbl">Invoice</span><span>' + sanitize(s.invoiceId || '—') + '</span></div>' +
+      '<div><span class="lbl">Status</span><span class="status paid">paid</span></div>' +
+      '<div><span class="lbl">Date</span><span>' + sanitize(s.paidAt || s.updatedAt || '') + '</span></div>';
+    $('receiptModal').classList.remove('hidden');
+  }
+  function closeReceipt() { $('receiptModal').classList.add('hidden'); }
+  function downloadReceipt() {
+    if (!lastReceipt) return;
+    const p = lastReceipt;
+    const text = [
+      'PayPaddy Receipt',
+      '----------------',
+      'Receipt: ' + (p.receiptId || '—'),
+      'Invoice: ' + (p.invoiceId || '—'),
+      'Amount:  $' + ((p.amount || 0) / 100).toFixed(2) + ' ' + (p.currency || 'usd').toUpperCase(),
+      'Gateway: ' + (p.gateway || '—'),
+      'Status:  ' + (p.status || '—'),
+      'Date:    ' + (p.paidAt || p.updatedAt || new Date().toISOString()),
+      '----------------'
+    ].join('\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+    a.download = 'receipt-' + (p.receiptId || p.id) + '.txt';
+    a.click();
+  }
+
+  // Return from gateway
+  (function () {
+    const params = new URLSearchParams(location.search);
+    if (params.get('payment') === 'success') {
+      showToast('Returned from gateway – status updates when webhook confirms');
+      history.replaceState({}, '', location.pathname);
+    } else if (params.get('payment') === 'cancel') {
+      showToast('Payment cancelled');
+      history.replaceState({}, '', location.pathname);
+    }
+  })();
+  </script>
+</body>
+</html>
